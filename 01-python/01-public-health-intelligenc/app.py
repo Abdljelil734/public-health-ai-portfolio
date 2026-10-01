@@ -297,50 +297,242 @@ if uploaded_file is not None:
 
 
             # --------------------------------------------------
-            # WOREDA / LOCATION GROUPED BAR CHART
+            # VISUALIZATION SELECTOR
             # --------------------------------------------------
 
-            st.subheader(
-                "📊 Woreda / Location Comparison Chart"
+            st.subheader("📊 Visualization")
+
+            chart_type = st.selectbox(
+                "Choose a visualization:",
+                [
+                    "Grouped Bar Chart",
+                    "Horizontal Bar Chart",
+                    "Pie Chart",
+                    "Stacked Bar Chart",
+                    "Scatter Plot"
+                ]
             )
 
 
-            # Remove missing values
+            # --------------------------------------------------
+            # REMOVE MISSING VALUES
+            # --------------------------------------------------
+
             chart_df = facility_df.dropna(
                 subset=["Reported"]
             )
 
 
-            # Create grouped bar chart
-            location_chart = px.bar(
-                chart_df,
-                x="Location",
-                y="Reported",
-                color="Indicator",
-                barmode="group",
-                title="Reported Values by Woreda / Location",
-                text="Reported"
-            )
+            # --------------------------------------------------
+            # GROUPED BAR CHART
+            # --------------------------------------------------
+
+            if chart_type == "Grouped Bar Chart":
+
+                location_chart = px.bar(
+                    chart_df,
+                    x="Location",
+                    y="Reported",
+                    color="Indicator",
+                    barmode="group",
+                    title="Reported Values by Woreda / Location",
+                    text="Reported"
+                )
+
+                location_chart.update_traces(
+                    textposition="outside"
+                )
+
+                location_chart.update_layout(
+                    xaxis_title="Woreda / Location",
+                    yaxis_title="Reported Value",
+                    height=600,
+                    legend_title="Indicator",
+                    xaxis_tickangle=-30
+                )
+
+                st.plotly_chart(
+                    location_chart,
+                    use_container_width=True
+                )
 
 
-            location_chart.update_traces(
-                textposition="outside"
-            )
+            # --------------------------------------------------
+            # HORIZONTAL BAR CHART
+            # --------------------------------------------------
+
+            elif chart_type == "Horizontal Bar Chart":
+
+                horizontal_chart = px.bar(
+                    chart_df,
+                    x="Reported",
+                    y="Location",
+                    color="Indicator",
+                    barmode="group",
+                    orientation="h",
+                    title="Reported Values by Woreda / Location",
+                    text="Reported"
+                )
+
+                horizontal_chart.update_traces(
+                    textposition="outside"
+                )
+
+                horizontal_chart.update_layout(
+                    xaxis_title="Reported Value",
+                    yaxis_title="Woreda / Location",
+                    height=600,
+                    legend_title="Indicator"
+                )
+
+                st.plotly_chart(
+                    horizontal_chart,
+                    use_container_width=True
+                )
 
 
-            location_chart.update_layout(
-                xaxis_title="Woreda / Location",
-                yaxis_title="Reported Value",
-                height=600,
-                legend_title="Indicator",
-                xaxis_tickangle=-30
-            )
+            # --------------------------------------------------
+            # PIE CHART
+            # --------------------------------------------------
+
+            elif chart_type == "Pie Chart":
+
+                pie_indicator = st.selectbox(
+                    "Select an indicator for the pie chart:",
+                    selected_indicators
+                )
 
 
-            st.plotly_chart(
-                location_chart,
-                use_container_width=True
-            )
+                pie_df = chart_df[
+                    chart_df["Indicator"]
+                    == pie_indicator
+                ]
+
+
+                pie_chart = px.pie(
+                    pie_df,
+                    names="Location",
+                    values="Reported",
+                    title=f"{pie_indicator} — Distribution by Location"
+                )
+
+
+                pie_chart.update_layout(
+                    height=600
+                )
+
+
+                st.plotly_chart(
+                    pie_chart,
+                    use_container_width=True
+                )
+
+
+            # --------------------------------------------------
+            # STACKED BAR CHART
+            # --------------------------------------------------
+
+            elif chart_type == "Stacked Bar Chart":
+
+                stacked_chart = px.bar(
+                    chart_df,
+                    x="Location",
+                    y="Reported",
+                    color="Indicator",
+                    barmode="stack",
+                    title="Indicator Composition by Woreda / Location",
+                    text="Reported"
+                )
+
+                stacked_chart.update_traces(
+                    textposition="inside"
+                )
+
+                stacked_chart.update_layout(
+                    xaxis_title="Woreda / Location",
+                    yaxis_title="Reported Value",
+                    height=600,
+                    legend_title="Indicator",
+                    xaxis_tickangle=-30
+                )
+
+                st.plotly_chart(
+                    stacked_chart,
+                    use_container_width=True
+                )
+
+
+            # --------------------------------------------------
+            # SCATTER PLOT
+            # --------------------------------------------------
+
+            elif chart_type == "Scatter Plot":
+
+                if len(selected_indicators) >= 2:
+
+                    scatter_x = st.selectbox(
+                        "Select X-axis indicator:",
+                        selected_indicators,
+                        key="scatter_x"
+                    )
+
+
+                    scatter_y_options = [
+                        indicator
+                        for indicator in selected_indicators
+                        if indicator != scatter_x
+                    ]
+
+
+                    scatter_y = st.selectbox(
+                        "Select Y-axis indicator:",
+                        scatter_y_options,
+                        key="scatter_y"
+                    )
+
+
+                    scatter_data = chart_df[
+                        chart_df["Indicator"].isin(
+                            [scatter_x, scatter_y]
+                        )
+                    ]
+
+
+                    scatter_pivot = scatter_data.pivot(
+                        index="Location",
+                        columns="Indicator",
+                        values="Reported"
+                    ).reset_index()
+
+
+                    scatter_chart = px.scatter(
+                        scatter_pivot,
+                        x=scatter_x,
+                        y=scatter_y,
+                        hover_name="Location",
+                        title=f"{scatter_y} vs {scatter_x}"
+                    )
+
+
+                    scatter_chart.update_layout(
+                        xaxis_title=scatter_x,
+                        yaxis_title=scatter_y,
+                        height=600
+                    )
+
+
+                    st.plotly_chart(
+                        scatter_chart,
+                        use_container_width=True
+                    )
+
+
+                else:
+
+                    st.info(
+                        "Select at least two indicators "
+                        "to create a scatter plot."
+                    )
 
 
         else:
