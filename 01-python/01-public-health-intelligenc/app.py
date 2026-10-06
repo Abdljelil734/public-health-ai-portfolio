@@ -1,2101 +1,1882 @@
-import streamlit as st
-import pandas as pd
+import io
+import html
+import difflib
 import numpy as np
+import pandas as pd
+import streamlit as st
 import plotly.express as px
-
-# ============================================================
-# PAGE CONFIGURATION
-# ============================================================
 
 st.set_page_config(
     page_title="Public Health Intelligence Platform",
     page_icon="🏥",
-    layout="wide"
+    layout="wide",
 )
 
 # ============================================================
-# TITLE
+# HELPERS
 # ============================================================
 
-st.title("🏥 Public Health Intelligence Platform")
+def normalize_text(value):
+    """Normalize text for safer indicator/Woreda matching."""
+    if pd.isna(value):
+        return ""
+    text = str(value).replace("\xa0", " ").strip().lower()
+    text = " ".join(text.split())
+    return text
 
-st.markdown(
-    """
-    **DHIS-2 + Data Analytics + AI-Assisted Public Health Intelligence**
 
-    Upload your public-health reporting dataset to generate:
-    - Indicator performance and ranking
-    - Woreda performance and ranking
-    - Priority identification
-    - Public-health intelligence
-    - Decision-support recommendations
-    - Interactive visualizations
-    """
-)
+def clean_number(value):
+    """Convert numbers such as '3,154' or ' 3,154 ' to numeric."""
+    if pd.isna(value):
+        return np.nan
+    if isinstance(value, str):
+        value = value.replace(",", "").strip()
+    return pd.to_numeric(value, errors="coerce")
 
-# ============================================================
-# SIDEBAR — DATA INPUT
-# KEEP THIS STRUCTURE
-# ============================================================
 
-st.sidebar.header("📂 Data Input")
+def classify_performance(value):
+    if pd.isna(value):
+        return "No Data"
+    if value >= 95:
+        return "Excellent"
+    if value >= 80:
+        return "Good"
+    if value >= 60:
+        return "Moderate"
+    return "Poor"
 
-uploaded_file = st.sidebar.file_uploader(
-    "Upload Excel or CSV file",
-    type=["xlsx", "xls", "csv"]
-)
 
-st.sidebar.markdown("---")
+def priority_level(score):
+    if score >= 50:
+        return "High"
+    if score >= 20:
+        return "Medium"
+    if score > 0:
+        return "Low"
+    return "No Immediate Priority"
 
-st.sidebar.info(
-    """
-    **Version 0.6**
 
-    Current focus:
-    - Data quality
-    - Performance intelligence
-    - Woreda ranking
-    - Indicator ranking
-    - Priority identification
-    - Decision support
-    - Selected indicator visualization
-    """
-)
+def priority_recommendation(level):
+    recommendations = {
+        "High": "Immediate review and corrective action required.",
+        "Medium": "Close monitoring and targeted supportive action recommended.",
+        "Low": "Monitor routinely and address emerging gaps.",
+        "No Immediate Priority": "Maintain current performance and routine monitoring.",
+    }
+    return recommendations.get(level, "Review data.")
 
-# ============================================================
-# NO FILE UPLOADED
-# ============================================================
 
-if uploaded_file is None:
+def read_performance_file(uploaded_file):
+    """Read the existing v0.6-style performance matrix."""
+    if uploaded_file is None:
+        return None
 
-    st.info("👈 Please upload an Excel or CSV dataset from the sidebar.")
+    name = uploaded_file.name.lower()
+    data = uploaded_file.getvalue()
 
-    st.markdown("## 🚀 What this platform can do")
+    try:
+        if name.endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(data))
+        else:
+            # Existing v0.6 format: first row is blank/title and row 2 has headers.
+            df = pd.read_excel(io.BytesIO(data), header=1)
+    except Exception as e:
+        st.error(f"Could not read the performance file: {e}")
+        return None
 
-    col1, col2, col3 = st.columns(3)
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed")]
+    if "Activity" not in df.columns and len(df.columns) > 0:
+        # Try to identify the indicator/activity column.
+        first_col = df.columns[0]
+        df = df.rename(columns={first_col: "Activity"})
 
-    with col1:
-        st.markdown(
-            """
-            ### 📋 Indicator Intelligence
+    if "Activity" not in df.columns:
+        st.error("The performance file must contain an 'Activity' column.")
+        return None
 
-            - Indicator performance
-            - Indicator ranking
-            - Reporting completeness
-            - Missing values
-            - Zero values
-            """
+    df["Activity"] = df["Activity"].astype(str).str.strip()
+    df = df[
+        (df["Activity"].notna())
+        & (df["Activity"].astype(str).str.strip() != "")
+        & (df["Activity"].astype(str).str.lower() != "nan")
+    ].copy()
+
+    for col in df.columns[1:]:
+        df[col] = pd.to_numeric(
+            df[col].astype(str).str.replace(",", "", regex=False),
+            errors="coerce",
         )
 
-    with col2:
-        st.markdown(
-            """
-            ### 🏘️ Woreda Intelligence
+    # Remove columns that contain no usable numeric values.
+    keep_cols = ["Activity"]
+    for col in df.columns[1:]:
+        if df[col].notna().any():
+            keep_cols.append(col)
+    df = df[keep_cols].copy()
 
-            - Woreda ranking
-            - Performance classification
-            - Underperforming Woredas
-            - Completeness analysis
-            """
-        )
+    return df
 
-    with col3:
-        st.markdown(
-            """
-            ### 🧠 Decision Support
 
-            - Priority identification
-            - Automatic alerts
-            - Public-health interpretation
-            - Management recommendations
-            """
-        )
-
-    st.stop()
-
-# ============================================================
-# READ DATA
-# ============================================================
-
-try:
-
-    if uploaded_file.name.lower().endswith(".csv"):
-
-        df = pd.read_csv(uploaded_file)
-
-    else:
-
-        # Excel files from your current dataset
-        # have the actual headers on row 2.
-        df = pd.read_excel(
-            uploaded_file,
-            header=1
-        )
-
-except Exception as e:
-
-    st.error(f"❌ Error reading the file: {e}")
-    st.stop()
-
-# ============================================================
-# CLEAN DATA
-# ============================================================
-
-df = df.dropna(how="all")
-
-df = df.dropna(
-    axis=1,
-    how="all"
-)
-
-df.columns = [
-    str(col).strip()
-    for col in df.columns
-]
-
-# ============================================================
-# CHECK ACTIVITY COLUMN
-# ============================================================
-
-if "Activity" not in df.columns:
-
-    st.error(
-        "❌ The dataset must contain an 'Activity' column."
-    )
-
-    st.write("Detected columns:")
-
-    st.write(
-        list(df.columns)
-    )
-
-    st.stop()
-
-# ============================================================
-# IDENTIFY WOREDA COLUMNS
-# ============================================================
-
-woreda_columns = [
-    col
-    for col in df.columns
-    if col != "Activity"
-]
-
-if len(woreda_columns) == 0:
-
-    st.error(
-        "❌ No Woreda columns were detected."
-    )
-
-    st.stop()
-
-# ============================================================
-# CONVERT WOREDA VALUES TO NUMERIC
-# ============================================================
-
-for col in woreda_columns:
-
-    df[col] = pd.to_numeric(
-        df[col],
-        errors="coerce"
-    )
-
-# ============================================================
-# REMOVE COMPLETELY EMPTY INDICATOR ROWS
-# ============================================================
-
-df = df[
-    df[woreda_columns]
-    .notna()
-    .any(axis=1)
-].copy()
-
-# ============================================================
-# INDICATORS
-# ============================================================
-
-indicators = (
-    df["Activity"]
-    .astype(str)
-    .str.strip()
-    .tolist()
-)
-
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
-
-def search_options(options, search_text):
-
-    if not search_text:
-
-        return options
-
-    search_text = search_text.lower()
-
-    return [
-        option
-        for option in options
-        if search_text in str(option).lower()
+def find_plan_header(raw):
+    """
+    Locate the plan header row containing Woreda names.
+    The uploaded plan currently has Woreda names on row 0.
+    """
+    preferred = [
+        "Atoti Ulo",
+        "Halaba Kulito TA",
+        "Wera Dijo",
+        "Wera",
     ]
 
-
-def classify_performance(completeness):
-
-    if completeness >= 95:
-
-        return "Excellent"
-
-    elif completeness >= 80:
-
-        return "Good"
-
-    elif completeness >= 60:
-
-        return "Moderate"
-
-    else:
-
-        return "Poor"
-
-
-def calculate_priority(
-    missing,
-    zero,
-    completeness
-):
-
-    score = (
-        (missing * 3)
-        + zero
-        + max(
-            0,
-            100 - completeness
+    for r in range(min(10, len(raw))):
+        row_values = [normalize_text(x) for x in raw.iloc[r].tolist()]
+        matches = sum(
+            1 for name in preferred
+            if normalize_text(name) in row_values
         )
+        if matches >= 2:
+            return r
+
+    return 0
+
+
+def read_plan_file(uploaded_file):
+    """
+    Read the Halaba HIV/STI/Hepatitis plan workbook.
+
+    Supports the current clean format:
+        index | Indicator | Atoti Ulo - Yearly | Atoti Ulo - Monthly |
+        ... | Halaba Zone - Yearly
+
+    It also retains compatibility with the older Baseline/Target layout.
+    """
+    if uploaded_file is None:
+        return None, None
+
+    name = uploaded_file.name.lower()
+    data = uploaded_file.getvalue()
+
+    try:
+        if name.endswith(".csv"):
+            raw = pd.read_csv(io.BytesIO(data), header=None)
+        else:
+            raw = pd.read_excel(io.BytesIO(data), header=None)
+    except Exception as e:
+        st.error(f"Could not read the plan file: {e}")
+        return None, None
+
+    raw = raw.dropna(axis=1, how="all")
+    if raw.empty:
+        st.error("The plan file appears to be empty.")
+        return None, None
+
+    # --------------------------------------------------------
+    # FORMAT 1: current clean plan format
+    # Header contains "Indicator" and columns such as
+    # "Atoti Ulo - Monthly".
+    # --------------------------------------------------------
+    clean_header_row = None
+    for r in range(min(10, len(raw))):
+        values = [normalize_text(x) for x in raw.iloc[r].tolist()]
+        if "indicator" in values and any(
+            "monthly" in x and "atoti ulo" in x for x in values
+        ):
+            clean_header_row = r
+            break
+
+    if clean_header_row is not None:
+        headers = [
+            str(x).strip() if pd.notna(x) else f"Unnamed_{i}"
+            for i, x in enumerate(raw.iloc[clean_header_row].tolist())
+        ]
+
+        data_df = raw.iloc[clean_header_row + 1:].copy()
+        data_df.columns = headers
+        data_df = data_df.dropna(how="all")
+
+        # Find the indicator column robustly.
+        indicator_col = next(
+            (c for c in data_df.columns if normalize_text(c) == "indicator"),
+            None,
+        )
+        if indicator_col is None:
+            st.error("The plan file has no Indicator column.")
+            return None, None
+
+        # Woreda aliases used in the plan workbook.
+        woreda_specs = {
+            "Atoti Ulo": "atoti ulo",
+            "Halaba Kulito TA": "halaba kulito ta",
+            "Wera Dijo": "wera dijo",
+            "Wera": "wera",
+        }
+
+        records = []
+        extra_by_indicator = {}
+
+        for _, row in data_df.iterrows():
+            indicator = row[indicator_col]
+            if pd.isna(indicator) or str(indicator).strip() == "":
+                continue
+
+            indicator = str(indicator).strip()
+
+            # Ignore accidental repeated header rows.
+            if normalize_text(indicator) == "indicator":
+                continue
+
+            extra = {
+                "Indicator": indicator,
+                "Zone Plan": np.nan,
+                "Monthly Plan": np.nan,
+                "Q1 Plan": np.nan,
+                "Q2 Plan": np.nan,
+                "Q3 Plan": np.nan,
+                "Q4 Plan": np.nan,
+            }
+
+            for col in data_df.columns:
+                ncol = normalize_text(col)
+
+                if "halaba zone" in ncol and "yearly" in ncol:
+                    extra["Zone Plan"] = clean_number(row[col])
+
+                if ncol.endswith("- monthly") or (
+                    "monthly" in ncol and "target" in ncol
+                ):
+                    # This is the zone-independent monthly column only if
+                    # it is not a Woreda-specific monthly column.
+                    if not any(
+                        normalize_text(w) in ncol
+                        for w in woreda_specs
+                    ):
+                        extra["Monthly Plan"] = clean_number(row[col])
+
+                for q in ["q1", "q2", "q3", "q4"]:
+                    if ncol.endswith(f"- {q}") and not any(
+                        normalize_text(w) in ncol
+                        for w in woreda_specs
+                    ):
+                        extra[f"{q.upper()} Plan"] = clean_number(row[col])
+
+            # Extract each Woreda's yearly and monthly target.
+            for display_woreda, base in woreda_specs.items():
+                yearly_col = None
+                monthly_col = None
+                q_cols = {}
+
+                for col in data_df.columns:
+                    ncol = normalize_text(col)
+                    if base in ncol:
+                        if "yearly" in ncol:
+                            yearly_col = col
+                        elif "monthly" in ncol:
+                            monthly_col = col
+                        elif "q1" in ncol:
+                            q_cols["Q1"] = col
+                        elif "q2" in ncol:
+                            q_cols["Q2"] = col
+                        elif "q3" in ncol:
+                            q_cols["Q3"] = col
+                        elif "q4" in ncol:
+                            q_cols["Q4"] = col
+
+                records.append({
+                    "Indicator": indicator,
+                    "Woreda": display_woreda,
+                    "Plan": clean_number(row[yearly_col]) if yearly_col else np.nan,
+                    "Annual Plan": clean_number(row[yearly_col]) if yearly_col else np.nan,
+                    "Monthly Plan": clean_number(row[monthly_col]) if monthly_col else np.nan,
+                    "Q1 Plan": clean_number(row[q_cols["Q1"]]) if "Q1" in q_cols else np.nan,
+                    "Q2 Plan": clean_number(row[q_cols["Q2"]]) if "Q2" in q_cols else np.nan,
+                    "Q3 Plan": clean_number(row[q_cols["Q3"]]) if "Q3" in q_cols else np.nan,
+                    "Q4 Plan": clean_number(row[q_cols["Q4"]]) if "Q4" in q_cols else np.nan,
+                    "Zone Plan": extra["Zone Plan"],
+                })
+
+        plan_long = pd.DataFrame(records)
+
+        if plan_long.empty:
+            st.error("No usable indicator/Woreda plan records were found.")
+            return None, None
+
+        # Make sure numeric fields are actually numeric.
+        for col in [
+            "Plan", "Annual Plan", "Monthly Plan",
+            "Q1 Plan", "Q2 Plan", "Q3 Plan", "Q4 Plan", "Zone Plan"
+        ]:
+            if col in plan_long.columns:
+                plan_long[col] = plan_long[col].apply(clean_number)
+
+        return plan_long, raw
+
+    # --------------------------------------------------------
+    # FORMAT 2: older Baseline/Target layout
+    # --------------------------------------------------------
+    preferred = [
+        "Atoti Ulo",
+        "Halaba Kulito TA",
+        "Wera Dijo",
+        "Wera",
+    ]
+
+    header_row = 0
+    for r in range(min(10, len(raw))):
+        row_values = [normalize_text(x) for x in raw.iloc[r].tolist()]
+        matches = sum(
+            1 for name in preferred
+            if normalize_text(name) in row_values
+        )
+        if matches >= 2:
+            header_row = r
+            break
+
+    header_values = raw.iloc[header_row].tolist()
+    zone_col = None
+    woreda_cols = {}
+
+    for idx, value in enumerate(header_values):
+        n = normalize_text(value)
+        if n == "halaba zone":
+            zone_col = idx
+        elif n in {
+            "atoti ulo",
+            "halaba kulito ta",
+            "wera dijo",
+            "wera",
+        }:
+            woreda_cols[str(value).strip()] = idx
+
+    if len(woreda_cols) < 2 and raw.shape[1] >= 8:
+        for idx in range(4, 8):
+            value = raw.iloc[header_row, idx]
+            if pd.notna(value):
+                woreda_cols[str(value).strip()] = idx
+
+    if len(woreda_cols) == 0:
+        st.error(
+            "I could not identify the Woreda target columns in the plan file."
+        )
+        return None, None
+
+    records = []
+
+    for r in range(len(raw) - 1):
+        indicator_number = clean_number(raw.iloc[r, 0])
+        indicator_name = raw.iloc[r, 1] if raw.shape[1] > 1 else np.nan
+        next_label = normalize_text(
+            raw.iloc[r + 1, 2] if raw.shape[1] > 2 else ""
+        )
+
+        if (
+            pd.notna(indicator_number)
+            and pd.notna(indicator_name)
+            and next_label == "target"
+        ):
+            indicator_name = str(indicator_name).strip()
+            target_row = r + 1
+
+            for woreda, col_idx in woreda_cols.items():
+                records.append({
+                    "Indicator Number": int(indicator_number),
+                    "Indicator": indicator_name,
+                    "Woreda": woreda,
+                    "Plan": clean_number(raw.iloc[target_row, col_idx]),
+                })
+
+    if not records:
+        st.error("No Target rows were detected in the plan file.")
+        return None, None
+
+    plan_long = pd.DataFrame(records)
+
+    monthly_col = None
+    quarter_cols = {}
+
+    for idx, value in enumerate(header_values):
+        n = normalize_text(value)
+        if n == "monthly target":
+            monthly_col = idx
+        elif n in {"q1", "q2", "q3", "q4"}:
+            quarter_cols[n.upper()] = idx
+
+    extra = []
+    for r in range(len(raw) - 1):
+        indicator_number = clean_number(raw.iloc[r, 0])
+        indicator_name = raw.iloc[r, 1] if raw.shape[1] > 1 else np.nan
+        next_label = normalize_text(
+            raw.iloc[r + 1, 2] if raw.shape[1] > 2 else ""
+        )
+
+        if (
+            pd.notna(indicator_number)
+            and pd.notna(indicator_name)
+            and next_label == "target"
+        ):
+            target_row = r + 1
+            extra.append({
+                "Indicator": str(indicator_name).strip(),
+                "Annual Plan": np.nan,
+                "Zone Plan": (
+                    clean_number(raw.iloc[target_row, zone_col])
+                    if zone_col is not None else np.nan
+                ),
+                "Monthly Plan": (
+                    clean_number(raw.iloc[target_row, monthly_col])
+                    if monthly_col is not None else np.nan
+                ),
+                "Q1 Plan": (
+                    clean_number(raw.iloc[target_row, quarter_cols["Q1"]])
+                    if "Q1" in quarter_cols else np.nan
+                ),
+                "Q2 Plan": (
+                    clean_number(raw.iloc[target_row, quarter_cols["Q2"]])
+                    if "Q2" in quarter_cols else np.nan
+                ),
+                "Q3 Plan": (
+                    clean_number(raw.iloc[target_row, quarter_cols["Q3"]])
+                    if "Q3" in quarter_cols else np.nan
+                ),
+                "Q4 Plan": (
+                    clean_number(raw.iloc[target_row, quarter_cols["Q4"]])
+                    if "Q4" in quarter_cols else np.nan
+                ),
+            })
+
+    extra_df = pd.DataFrame(extra)
+    if not extra_df.empty:
+        plan_long = plan_long.merge(
+            extra_df, on="Indicator", how="left"
+        )
+
+    return plan_long, raw
+
+def match_indicators(plan_indicators, actual_indicators):
+    """
+    Match actual indicator names to plan indicators.
+    Exact normalized matching is preferred.
+    Fuzzy matching is used only when similarity is high.
+    """
+    plan_lookup = {
+        normalize_text(x): x
+        for x in plan_indicators
+        if normalize_text(x)
+    }
+
+    matches = []
+    plan_norms = list(plan_lookup.keys())
+
+    for actual in actual_indicators:
+        actual_norm = normalize_text(actual)
+
+        if actual_norm in plan_lookup:
+            matches.append(
+                {
+                    "Actual Indicator": actual,
+                    "Plan Indicator": plan_lookup[actual_norm],
+                    "Match Type": "Exact",
+                    "Similarity": 100.0,
+                }
+            )
+            continue
+
+        # First try containment.
+        contained = [
+            p for p in plan_norms
+            if actual_norm in p or p in actual_norm
+        ]
+
+        if len(contained) == 1:
+            p = contained[0]
+            matches.append(
+                {
+                    "Actual Indicator": actual,
+                    "Plan Indicator": plan_lookup[p],
+                    "Match Type": "Name similarity",
+                    "Similarity": 95.0,
+                }
+            )
+            continue
+
+        candidates = difflib.get_close_matches(
+            actual_norm,
+            plan_norms,
+            n=1,
+            cutoff=0.86,
+        )
+
+        if candidates:
+            p = candidates[0]
+            ratio = difflib.SequenceMatcher(
+                None, actual_norm, p
+            ).ratio() * 100
+
+            matches.append(
+                {
+                    "Actual Indicator": actual,
+                    "Plan Indicator": plan_lookup[p],
+                    "Match Type": "Fuzzy",
+                    "Similarity": round(ratio, 1),
+                }
+            )
+        else:
+            matches.append(
+                {
+                    "Actual Indicator": actual,
+                    "Plan Indicator": None,
+                    "Match Type": "Unmatched",
+                    "Similarity": 0.0,
+                }
+            )
+
+    return pd.DataFrame(matches)
+
+
+def normalize_woreda_name(value):
+    """Create a flexible key so plan and performance Woreda labels can match."""
+    if pd.isna(value):
+        return ""
+    x = normalize_text(value)
+    # Common reporting suffixes used in plan/performance files.
+    for token in [
+        "town administration",
+        "woreda",
+        "district",
+    ]:
+        x = x.replace(token, " ")
+    x = " ".join(x.split())
+    # Treat TA and Town as naming variants when they are used only as a
+    # geographic suffix in one of the two files.
+    x = x.replace(" ta", " ")
+    x = x.replace(" town", " ")
+    return " ".join(x.split())
+
+
+def build_plan_actual(performance_df, plan_long, months_covered=1):
+    """Merge performance with a period-adjusted plan using Indicator + Woreda.
+
+    The main Plan value is the monthly target multiplied by the selected
+    number of months. The official annual Woreda target is retained as a
+    reference column and is not used for shorter reporting periods.
+    """
+    actual_long = performance_df.melt(
+        id_vars=["Activity"],
+        var_name="Woreda",
+        value_name="Actual",
+    ).rename(columns={"Activity": "Actual Indicator"})
+
+    actual_long["Actual"] = pd.to_numeric(
+        actual_long["Actual"], errors="coerce"
     )
 
-    if score >= 50:
+    # Match indicators.
+    mapping = match_indicators(
+        plan_long["Indicator"].dropna().unique().tolist(),
+        actual_long["Actual Indicator"].dropna().unique().tolist(),
+    )
 
-        level = "High"
+    actual_long = actual_long.merge(
+        mapping,
+        on="Actual Indicator",
+        how="left",
+    )
 
-    elif score >= 20:
+    # Normalize Woreda names for safer matching.
+    plan_long = plan_long.copy()
+    actual_long["Woreda Key"] = actual_long["Woreda"].map(normalize_woreda_name)
+    plan_long["Woreda Key"] = plan_long["Woreda"].map(normalize_woreda_name)
 
-        level = "Medium"
+    merged = actual_long.merge(
+        plan_long,
+        left_on=["Plan Indicator", "Woreda Key"],
+        right_on=["Indicator", "Woreda Key"],
+        how="left",
+        suffixes=("", "_plan"),
+    )
 
-    elif score > 0:
+    # Preserve the official annual target and calculate the target for the
+    # selected reporting period from the monthly target.
+    merged["Annual Plan"] = pd.to_numeric(
+        merged.get("Plan", np.nan), errors="coerce"
+    )
+    merged["Monthly Plan"] = pd.to_numeric(
+        merged.get("Monthly Plan", np.nan), errors="coerce"
+    )
+    merged["Months Covered"] = int(months_covered)
+    merged["Period Plan"] = merged["Monthly Plan"] * int(months_covered)
 
-        level = "Low"
+    # If a monthly target is unavailable, retain the annual target only for
+    # the 12-month period as a fallback.
+    annual_fallback = (
+        (merged["Months Covered"] == 12)
+        & merged["Period Plan"].isna()
+        & merged["Annual Plan"].notna()
+    )
+    merged.loc[annual_fallback, "Period Plan"] = merged.loc[annual_fallback, "Annual Plan"]
 
-    else:
+    # All downstream Plan-vs-Actual calculations use the selected period plan.
+    merged["Plan"] = merged["Period Plan"]
 
-        level = "No Immediate Priority"
+    # Gap is defined as Actual minus Expected Plan. Negative means below plan.
+    merged["Gap"] = merged["Actual"] - merged["Plan"]
 
-    return score, level
+    merged["Achievement %"] = np.where(
+        merged["Plan"] > 0,
+        (merged["Actual"] / merged["Plan"]) * 100,
+        np.nan,
+    )
+
+    def interpret(row):
+        plan = row["Plan"]
+        actual = row["Actual"]
+        ach = row["Achievement %"]
+
+        if pd.isna(plan):
+            return "No matching plan"
+        if pd.isna(actual):
+            return "No actual reported"
+        if plan == 0 and actual == 0:
+            return "Zero plan and zero actual"
+        if plan == 0 and actual > 0:
+            return "Actual reported against zero plan - validate"
+        if actual == 0 and plan > 0:
+            return "Critical - zero reported"
+        if ach >= 100:
+            return "Target met/exceeded"
+        if ach >= 95:
+            return "Excellent"
+        if ach >= 80:
+            return "Good"
+        if ach >= 60:
+            return "Moderate"
+        return "Poor"
+
+    merged["Interpretation"] = merged.apply(interpret, axis=1)
+
+    def pa_priority(row):
+        plan = row["Plan"]
+        actual = row["Actual"]
+        ach = row["Achievement %"]
+
+        if pd.isna(plan):
+            return "Review"
+        if pd.isna(actual):
+            return "High"
+        if plan > 0 and actual == 0:
+            return "High"
+        if pd.notna(ach) and ach < 60:
+            return "High"
+        if pd.notna(ach) and ach < 80:
+            return "Medium"
+        if pd.notna(ach) and ach < 95:
+            return "Low"
+        if plan == 0 and actual > 0:
+            return "Review"
+        return "No Immediate Priority"
+
+    merged["Priority"] = merged.apply(pa_priority, axis=1)
+
+    return merged, mapping
 
 
-def woreda_recommendation(row):
+def aggregate_plan_actual_by_indicator(pa_df):
+    """Aggregate Woreda-level plan and actual to indicator level."""
+    work = pa_df.copy()
+    work["Plan"] = pd.to_numeric(work["Plan"], errors="coerce")
+    work["Actual"] = pd.to_numeric(work["Actual"], errors="coerce")
 
-    if row["Completeness %"] < 60:
-
-        return (
-            "Urgent follow-up required. "
-            "Review reporting completeness, "
-            "missing indicators and data submission."
+    result = (
+        work.groupby("Plan Indicator", dropna=False)
+        .agg(
+            Woredas=("Woreda", "nunique"),
+            Plan=("Plan", "sum"),
+            Actual=("Actual", "sum"),
+            Missing_Woredas=("Actual", lambda s: int(s.isna().sum())),
+            Zero_Woredas=(
+                "Actual",
+                lambda s: int((s.fillna(np.nan) == 0).sum()),
+            ),
         )
+        .reset_index()
+    )
 
-    elif row["Completeness %"] < 80:
-
-        return (
-            "Conduct targeted supportive supervision "
-            "and improve reporting completeness."
+    result["Achievement %"] = np.where(
+        result["Plan"] > 0,
+        result["Actual"] / result["Plan"] * 100,
+        np.nan,
+    )
+    result["Gap"] = result["Actual"] - result["Plan"]
+    result["Performance"] = result["Achievement %"].apply(
+        classify_performance
+    )
+    result["Priority"] = result["Achievement %"].apply(
+        lambda x: (
+            "High" if pd.notna(x) and x < 60
+            else "Medium" if pd.notna(x) and x < 80
+            else "Low" if pd.notna(x) and x < 95
+            else "No Immediate Priority"
+            if pd.notna(x)
+            else "Review"
         )
+    )
+    return result
 
-    elif row["Zero Values"] > 0:
 
-        return (
-            "Review zero-reported indicators and "
-            "verify whether zeros represent true "
-            "program performance."
+def aggregate_plan_actual_by_woreda(pa_df):
+    """Aggregate Woreda-level plan and actual."""
+    work = pa_df.copy()
+    work["Plan"] = pd.to_numeric(work["Plan"], errors="coerce")
+    work["Actual"] = pd.to_numeric(work["Actual"], errors="coerce")
+
+    result = (
+        work.groupby("Woreda", dropna=False)
+        .agg(
+            Indicators=("Plan Indicator", "nunique"),
+            Plan=("Plan", "sum"),
+            Actual=("Actual", "sum"),
+            Missing_Indicators=("Actual", lambda s: int(s.isna().sum())),
+            Zero_Indicators=(
+                "Actual",
+                lambda s: int((s.fillna(np.nan) == 0).sum()),
+            ),
         )
+        .reset_index()
+    )
 
-    else:
-
-        return (
-            "Maintain performance and share good practices "
-            "with lower-performing Woredas."
+    result["Achievement %"] = np.where(
+        result["Plan"] > 0,
+        result["Actual"] / result["Plan"] * 100,
+        np.nan,
+    )
+    result["Gap"] = result["Actual"] - result["Plan"]
+    result["Performance"] = result["Achievement %"].apply(
+        classify_performance
+    )
+    result["Priority"] = result["Achievement %"].apply(
+        lambda x: (
+            "High" if pd.notna(x) and x < 60
+            else "Medium" if pd.notna(x) and x < 80
+            else "Low" if pd.notna(x) and x < 95
+            else "No Immediate Priority"
+            if pd.notna(x)
+            else "Review"
         )
-
-
-def indicator_recommendation(row):
-
-    if row["Reporting %"] < 60:
-
-        return (
-            "High attention required. Investigate missing "
-            "reports and strengthen reporting mechanisms."
-        )
-
-    elif row["Reporting %"] < 80:
-
-        return (
-            "Improve reporting completeness through "
-            "facility-level follow-up and supportive supervision."
-        )
-
-    elif row["Zero Values"] > 0:
-
-        return (
-            "Validate zero values and determine whether "
-            "they reflect actual service performance."
-        )
-
-    else:
-
-        return (
-            "Continue monitoring and maintain reporting quality."
-        )
+    )
+    return result
 
 
 # ============================================================
-# SIDEBAR — DATA SELECTION
-# KEEP ON LEFT
+# SIDEBAR
 # ============================================================
+
+st.sidebar.title("🏥 Public Health Intelligence")
+
+st.sidebar.subheader("📂 Data Input")
+
+performance_file = st.sidebar.file_uploader(
+    "📄 Upload Performance / Actual Data",
+    type=["xlsx", "xls", "csv"],
+    help="Your current reporting/performance file.",
+)
+
+plan_file = st.sidebar.file_uploader(
+    "🎯 Upload Plan / Target Data — Optional",
+    type=["xlsx", "xls", "csv"],
+    help="Optional. Upload a plan to activate Plan-vs-Actual intelligence.",
+)
+
+months_covered = 1
+if plan_file is not None:
+    st.sidebar.subheader("📅 Performance Period")
+    month_options = list(range(1, 13))
+    months_covered = st.sidebar.selectbox(
+        "Number of months of actual data",
+        options=month_options,
+        index=1,
+        format_func=lambda n: {
+            1: "1 month",
+            3: "3 months — Quarterly",
+            6: "6 months — Half-year",
+            9: "9 months — 3 quarters",
+            12: "12 months — Annual",
+        }.get(n, f"{n} months"),
+        key="months_covered_v071",
+        help=(
+            "The app compares actual performance with Monthly Target × "
+            "the selected number of months. For 12 months, the official "
+            "annual target is also retained for reference."
+        ),
+    )
+    st.sidebar.caption(
+        f"Expected period plan = Monthly Target × {months_covered} month(s)"
+    )
 
 st.sidebar.markdown("---")
 
-st.sidebar.header("🔎 Data Selection")
+# ============================================================
+# LOAD PERFORMANCE DATA
+# ============================================================
 
-# ------------------------------------------------------------
-# INDICATOR SEARCH
-# ------------------------------------------------------------
+df = read_performance_file(performance_file)
+
+if df is None:
+    st.title("🏥 Public Health Intelligence Platform")
+    st.info(
+        "Upload your Performance / Actual Excel or CSV file from the "
+        "left sidebar to begin."
+    )
+    st.markdown(
+        """
+### Version 0.7
+
+This version supports two operating modes:
+
+**🟢 Performance-only mode**
+- Trend analysis
+- Indicator comparison
+- Woreda comparison
+- Completeness
+- Priority identification
+- Public-health intelligence
+- Visualizations
+
+**🎯 Plan-vs-Actual mode**
+- Upload the optional Plan/Target file
+- Automatic Indicator + Woreda matching
+- Achievement %
+- Gap analysis
+- Underperforming Woredas and indicators
+- Automatic interpretation
+- Decision-support recommendations
+        """
+    )
+    st.stop()
+
+# ============================================================
+# OPTIONAL PLAN
+# ============================================================
+
+plan_long = None
+plan_raw = None
+
+if plan_file is not None:
+    plan_long, plan_raw = read_plan_file(plan_file)
+
+# ============================================================
+# SIDEBAR DATA SELECTION
+# ============================================================
+
+st.sidebar.subheader("🔎 Data Selection")
+
+indicator_options = df["Activity"].dropna().astype(str).unique().tolist()
+
+if "selected_indicators_v06" not in st.session_state:
+    st.session_state.selected_indicators_v06 = indicator_options.copy()
 
 indicator_search = st.sidebar.text_input(
     "Search indicators",
-    placeholder="Type indicator name..."
+    placeholder="Type letters to search...",
+    key="indicator_search_v07",
 )
 
-filtered_indicators = search_options(
-    indicators,
-    indicator_search
-)
-
-if not filtered_indicators:
-
-    st.sidebar.warning(
-        "No indicators match your search."
-    )
-
-    filtered_indicators = indicators
-
-# ------------------------------------------------------------
-# INDICATOR SELECTION
-# ------------------------------------------------------------
-
-if "selected_indicators_v06" not in st.session_state:
-
-    st.session_state.selected_indicators_v06 = (
-        indicators.copy()
-    )
+filtered_indicators = [
+    x for x in indicator_options
+    if indicator_search.lower() in x.lower()
+]
 
 selected_indicators = st.sidebar.multiselect(
-
     "Select indicators",
-
     options=filtered_indicators,
-
     default=[
-        x
-        for x in st.session_state.selected_indicators_v06
+        x for x in st.session_state.selected_indicators_v06
         if x in filtered_indicators
     ],
-
-    key="indicator_selector_v06"
+    key="indicator_multiselect_v07",
 )
 
-st.session_state.selected_indicators_v06 = (
-    selected_indicators
+st.session_state.selected_indicators_v06 = selected_indicators
+
+# Highlight selected indicator names in the sidebar so long names remain easy to read.
+st.sidebar.markdown(
+    """
+    <style>
+    /* Give the sidebar a little more horizontal space for long DHIS-2 names. */
+    [data-testid="stSidebar"] {
+        min-width: 360px;
+        max-width: 420px;
+    }
+
+    /* Make the selected-indicator area visually distinct. */
+    .selected-indicator-box {
+        background: rgba(49, 130, 206, 0.12);
+        border-left: 4px solid #3182ce;
+        border-radius: 6px;
+        padding: 8px 10px;
+        margin: 5px 0 6px 0;
+        line-height: 1.35;
+        word-wrap: break-word;
+        overflow-wrap: anywhere;
+    }
+
+    .selected-indicator-title {
+        font-weight: 700;
+        margin-bottom: 7px;
+    }
+
+    .selected-indicator-name {
+        background: rgba(255, 255, 0, 0.22);
+        border-radius: 4px;
+        padding: 5px 7px;
+        margin: 4px 0;
+        font-size: 0.88rem;
+        font-weight: 600;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-# ------------------------------------------------------------
-# WOREDA SEARCH
-# ------------------------------------------------------------
+if selected_indicators:
+    selected_html = [
+        '<div class="selected-indicator-box">',
+        f'<div class="selected-indicator-title">🎯 Selected indicators ({len(selected_indicators)})</div>',
+    ]
+    for indicator in selected_indicators:
+        safe_indicator = html.escape(str(indicator))
+        selected_html.append(
+            f'<div class="selected-indicator-name">✓ {safe_indicator}</div>'
+        )
+    selected_html.append('</div>')
+    st.sidebar.markdown("".join(selected_html), unsafe_allow_html=True)
+else:
+    st.sidebar.info("No indicator selected.")
+
+woreda_options = [
+    c for c in df.columns
+    if c != "Activity"
+]
+
+if "selected_woredas_v06" not in st.session_state:
+    st.session_state.selected_woredas_v06 = woreda_options.copy()
 
 woreda_search = st.sidebar.text_input(
     "Search Woredas",
-    placeholder="Type Woreda name..."
+    placeholder="Type letters to search...",
+    key="woreda_search_v07",
 )
 
-filtered_woredas = search_options(
-    woreda_columns,
-    woreda_search
-)
-
-if not filtered_woredas:
-
-    st.sidebar.warning(
-        "No Woredas match your search."
-    )
-
-    filtered_woredas = woreda_columns
-
-# ------------------------------------------------------------
-# WOREDA SELECTION
-# ------------------------------------------------------------
-
-if "selected_woredas_v06" not in st.session_state:
-
-    st.session_state.selected_woredas_v06 = (
-        woreda_columns.copy()
-    )
-
-selected_woredas = st.sidebar.multiselect(
-
-    "Select Woredas",
-
-    options=filtered_woredas,
-
-    default=[
-        x
-        for x in st.session_state.selected_woredas_v06
-        if x in filtered_woredas
-    ],
-
-    key="woreda_selector_v06"
-)
-
-st.session_state.selected_woredas_v06 = (
-    selected_woredas
-)
-
-# ============================================================
-# VALIDATE SELECTION
-# ============================================================
-
-if not selected_indicators:
-
-    st.warning(
-        "⚠️ Please select at least one indicator."
-    )
-
-    st.stop()
-
-if not selected_woredas:
-
-    st.warning(
-        "⚠️ Please select at least one Woreda."
-    )
-
-    st.stop()
-
-# ============================================================
-# SELECTED DATA
-# ============================================================
-
-selected_df = df[
-    df["Activity"].isin(
-        selected_indicators
-    )
-].copy()
-
-# ============================================================
-# ANALYSIS VALUES
-# ============================================================
-
-analysis_values = selected_df[
-    selected_woredas
+filtered_woredas = [
+    x for x in woreda_options
+    if woreda_search.lower() in x.lower()
 ]
 
-total_cells = analysis_values.size
-
-reported_cells = (
-    analysis_values
-    .notna()
-    .sum()
-    .sum()
+selected_woredas = st.sidebar.multiselect(
+    "Select Woredas",
+    options=filtered_woredas,
+    default=[
+        x for x in st.session_state.selected_woredas_v06
+        if x in filtered_woredas
+    ],
+    key="woreda_multiselect_v07",
 )
 
-missing_cells = (
-    analysis_values
-    .isna()
-    .sum()
-    .sum()
-)
+st.session_state.selected_woredas_v06 = selected_woredas
 
-zero_cells = (
-    analysis_values == 0
-).sum().sum()
+# Apply selection.
+selected_df = df[
+    df["Activity"].isin(selected_indicators)
+][["Activity"] + [
+    c for c in selected_woredas if c in df.columns
+]].copy()
 
-overall_completeness = (
-
-    reported_cells
-    / total_cells
-    * 100
-
-    if total_cells > 0
-
-    else 0
-)
+if len(selected_woredas) == 0:
+    selected_df = df[
+        df["Activity"].isin(selected_indicators)
+    ].copy()
 
 # ============================================================
-# EXECUTIVE SNAPSHOT
+# PLAN-ACTUAL MERGE
 # ============================================================
 
-st.markdown("---")
+pa_df = None
+indicator_match_df = None
 
-st.subheader("📌 Executive Snapshot")
-
-c1, c2, c3, c4, c5, c6 = st.columns(6)
-
-with c1:
-
-    st.metric(
-        "Indicators",
-        len(selected_indicators)
+if plan_long is not None and not selected_df.empty:
+    pa_df, indicator_match_df = build_plan_actual(
+        df,
+        plan_long,
+        months_covered=months_covered,
     )
-
-with c2:
-
-    st.metric(
-        "Woredas",
-        len(selected_woredas)
-    )
-
-with c3:
-
-    st.metric(
-        "Completeness",
-        f"{overall_completeness:.1f}%"
-    )
-
-with c4:
-
-    st.metric(
-        "Reported",
-        f"{reported_cells:,}"
-    )
-
-with c5:
-
-    st.metric(
-        "Missing",
-        f"{missing_cells:,}"
-    )
-
-with c6:
-
-    st.metric(
-        "Zero Values",
-        f"{zero_cells:,}"
-    )
-
-# ============================================================
-# INDICATOR PERFORMANCE
-# ============================================================
-
-indicator_rows = []
-
-for indicator in selected_indicators:
-
-    indicator_data = selected_df[
-        selected_df["Activity"] == indicator
-    ]
-
-    if indicator_data.empty:
-
-        continue
-
-    row = indicator_data[
-        selected_woredas
-    ].iloc[0]
-
-    total_woredas = len(
-        selected_woredas
-    )
-
-    reported = row.notna().sum()
-
-    missing = row.isna().sum()
-
-    zero = (row == 0).sum()
-
-    reporting_percent = (
-
-        reported
-        / total_woredas
-        * 100
-
-        if total_woredas > 0
-
-        else 0
-    )
-
-    performance = classify_performance(
-        reporting_percent
-    )
-
-    priority_score, priority_level = (
-        calculate_priority(
-            missing,
-            zero,
-            reporting_percent
-        )
-    )
-
-    indicator_rows.append(
-        {
-            "Indicator": indicator,
-            "Reported Woredas": reported,
-            "Missing Woredas": missing,
-            "Zero Values": zero,
-            "Reporting %": reporting_percent,
-            "Performance": performance,
-            "Priority Score": priority_score,
-            "Priority": priority_level
-        }
-    )
-
-indicator_performance = pd.DataFrame(
-    indicator_rows
-)
-
-indicator_ranking = (
-    indicator_performance
-    .sort_values(
-        by="Reporting %",
-        ascending=False
-    )
-    .reset_index(drop=True)
-)
-
-indicator_ranking.insert(
-    0,
-    "Rank",
-    range(
-        1,
-        len(indicator_ranking) + 1
-    )
-)
-
-# ============================================================
-# WOREDA PERFORMANCE
-# ============================================================
-
-woreda_rows = []
-
-for woreda in selected_woredas:
-
-    values = selected_df[woreda]
-
-    total_indicators = len(
-        selected_indicators
-    )
-
-    reported = values.notna().sum()
-
-    missing = values.isna().sum()
-
-    zero = (values == 0).sum()
-
-    completeness = (
-
-        reported
-        / total_indicators
-        * 100
-
-        if total_indicators > 0
-
-        else 0
-    )
-
-    performance = classify_performance(
-        completeness
-    )
-
-    priority_score, priority_level = (
-        calculate_priority(
-            missing,
-            zero,
-            completeness
-        )
-    )
-
-    woreda_rows.append(
-        {
-            "Woreda": woreda,
-            "Reported Indicators": reported,
-            "Missing Indicators": missing,
-            "Zero Values": zero,
-            "Completeness %": completeness,
-            "Performance": performance,
-            "Priority Score": priority_score,
-            "Priority": priority_level
-        }
-    )
-
-woreda_performance = pd.DataFrame(
-    woreda_rows
-)
-
-woreda_ranking = (
-    woreda_performance
-    .sort_values(
-        by="Completeness %",
-        ascending=False
-    )
-    .reset_index(drop=True)
-)
-
-woreda_ranking.insert(
-    0,
-    "Rank",
-    range(
-        1,
-        len(woreda_ranking) + 1
-    )
-)
-
-# ============================================================
-# RECOMMENDATIONS
-# ============================================================
-
-woreda_ranking[
-    "Recommendation"
-] = woreda_ranking.apply(
-    woreda_recommendation,
-    axis=1
-)
-
-indicator_ranking[
-    "Recommendation"
-] = indicator_ranking.apply(
-    indicator_recommendation,
-    axis=1
-)
 
 # ============================================================
 # TABS
 # ============================================================
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+tabs = [
+    "📊 Overview",
+    "📋 Indicator Performance & Ranking",
+    "🏘️ Woreda Performance & Ranking",
+    "🚨 Priority Identification",
+    "🧠 Public-Health Intelligence",
+    "💡 Decision-Support Recommendations",
+    "📈 Visualization",
+]
 
-    [
-        "📊 Overview",
-        "📋 Indicator Performance & Ranking",
-        "🏘️ Woreda Performance & Ranking",
-        "🚨 Priority Identification",
-        "🧠 Public-Health Intelligence",
-        "💡 Decision-Support Recommendations",
-        "📈 Visualization"
-    ]
-)
+if plan_long is not None:
+    tabs.append("🎯 Plan vs Actual Intelligence")
+
+tab_objects = st.tabs(tabs)
 
 # ============================================================
-# TAB 1 — OVERVIEW
+# TAB 1: OVERVIEW
 # ============================================================
 
-with tab1:
+with tab_objects[0]:
+    st.header("📊 Executive Overview")
 
-    st.header(
-        "📊 Public Health Data Overview"
+    total_indicators = len(selected_df)
+    total_woredas = len(
+        [c for c in selected_df.columns if c != "Activity"]
     )
 
-    st.markdown(
-        """
-        This section provides a high-level assessment
-        of completeness and reporting status.
-        """
+    numeric_values = selected_df.iloc[:, 1:].apply(
+        pd.to_numeric, errors="coerce"
     )
 
-    col1, col2 = st.columns(2)
+    total_cells = numeric_values.size
+    reported_cells = int(numeric_values.notna().sum().sum())
+    missing_cells = total_cells - reported_cells
+    zero_cells = int((numeric_values == 0).sum().sum())
 
-    with col1:
+    completeness = (
+        reported_cells / total_cells * 100
+        if total_cells > 0
+        else 0
+    )
 
-        st.subheader(
-            "📌 Overall Data Quality"
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+
+    c1.metric("Indicators", total_indicators)
+    c2.metric("Woredas", total_woredas)
+    c3.metric("Reporting Completeness", f"{completeness:.1f}%")
+    c4.metric("Reported Values", f"{reported_cells:,}")
+    c5.metric("Missing Values", f"{missing_cells:,}")
+    c6.metric("Zero Values", f"{zero_cells:,}")
+
+    st.subheader("Selected Data Preview")
+    st.dataframe(
+        selected_df,
+        use_container_width=True,
+        height=420,
+    )
+
+    if plan_long is not None:
+        st.success(
+            "🎯 Plan file detected. Plan-vs-Actual Intelligence is active."
+        )
+    else:
+        st.info(
+            "Performance-only mode is active. Uploading a Plan/Target file "
+            "will activate Plan-vs-Actual Intelligence."
         )
 
-        quality_data = pd.DataFrame(
-            {
-                "Measure": [
-                    "Total data cells",
-                    "Reported cells",
-                    "Missing cells",
-                    "Zero values",
-                    "Completeness"
-                ],
+# ============================================================
+# TAB 2: INDICATOR PERFORMANCE
+# ============================================================
 
-                "Value": [
-                    f"{total_cells:,}",
-                    f"{reported_cells:,}",
-                    f"{missing_cells:,}",
-                    f"{zero_cells:,}",
-                    f"{overall_completeness:.1f}%"
-                ]
+with tab_objects[1]:
+    st.header("📋 Indicator Performance & Ranking")
+
+    work = selected_df.copy()
+    rows = []
+
+    for _, row in work.iterrows():
+        values = pd.to_numeric(
+            row.iloc[1:],
+            errors="coerce",
+        )
+
+        total = len(values)
+        reported = int(values.notna().sum())
+        missing = total - reported
+        zeros = int((values == 0).sum())
+        reporting_pct = (
+            reported / total * 100
+            if total > 0
+            else 0
+        )
+
+        performance = classify_performance(reporting_pct)
+        score = (
+            missing * 3
+            + zeros
+            + max(0, 100 - reporting_pct)
+        )
+        priority = priority_level(score)
+
+        rows.append(
+            {
+                "Indicator": row["Activity"],
+                "Reported Woredas": reported,
+                "Missing Woredas": missing,
+                "Zero Values": zeros,
+                "Reporting %": round(reporting_pct, 1),
+                "Performance": performance,
+                "Priority Score": round(score, 1),
+                "Priority": priority,
+                "Recommendation": priority_recommendation(priority),
             }
         )
 
-        st.dataframe(
-            quality_data,
-            use_container_width=True,
-            hide_index=True
+    indicator_rank = pd.DataFrame(rows).sort_values(
+        ["Priority Score", "Reporting %"],
+        ascending=[False, True],
+    )
+
+    st.dataframe(
+        indicator_rank,
+        use_container_width=True,
+        height=500,
+    )
+
+# ============================================================
+# TAB 3: WOREDA PERFORMANCE
+# ============================================================
+
+with tab_objects[2]:
+    st.header("🏘️ Woreda Performance & Ranking")
+
+    rows = []
+
+    for woreda in selected_woredas:
+        if woreda not in selected_df.columns:
+            continue
+
+        values = pd.to_numeric(
+            selected_df[woreda],
+            errors="coerce",
         )
 
-    with col2:
-
-        st.subheader(
-            "📊 Data Completeness"
+        total = len(values)
+        reported = int(values.notna().sum())
+        missing = total - reported
+        zeros = int((values == 0).sum())
+        completeness = (
+            reported / total * 100
+            if total > 0
+            else 0
         )
 
-        completeness_chart = pd.DataFrame(
+        performance = classify_performance(completeness)
+        score = (
+            missing * 3
+            + zeros
+            + max(0, 100 - completeness)
+        )
+        priority = priority_level(score)
+
+        rows.append(
             {
-                "Category": [
-                    "Reported",
-                    "Missing"
-                ],
-
-                "Value": [
-                    reported_cells,
-                    missing_cells
-                ]
+                "Woreda": woreda,
+                "Reported Indicators": reported,
+                "Missing Indicators": missing,
+                "Zero Values": zeros,
+                "Completeness %": round(completeness, 1),
+                "Performance": performance,
+                "Priority Score": round(score, 1),
+                "Priority": priority,
+                "Recommendation": priority_recommendation(priority),
             }
         )
 
-        fig = px.pie(
-            completeness_chart,
-            names="Category",
-            values="Value",
-            title="Reported vs Missing Data"
-        )
-
-        st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
-
-    st.markdown("---")
-
-    st.subheader(
-        "🏘️ Woreda Reporting Status"
+    woreda_rank = pd.DataFrame(rows).sort_values(
+        ["Priority Score", "Completeness %"],
+        ascending=[False, True],
     )
 
     st.dataframe(
-        woreda_ranking[
-            [
-                "Rank",
-                "Woreda",
-                "Reported Indicators",
-                "Missing Indicators",
-                "Zero Values",
-                "Completeness %",
-                "Performance"
-            ]
-        ],
+        woreda_rank,
         use_container_width=True,
-        hide_index=True
+        height=500,
     )
 
 # ============================================================
-# TAB 2 — INDICATOR PERFORMANCE
+# TAB 4: PRIORITY IDENTIFICATION
 # ============================================================
 
-with tab2:
+with tab_objects[3]:
+    st.header("🚨 Priority Identification")
 
-    st.header(
-        "📋 Indicator Performance & Ranking"
+    overall_priority_score = (
+        missing_cells * 3
+        + zero_cells
+        + max(0, 100 - completeness)
     )
 
-    st.markdown(
-        """
-        Indicators are ranked according to reporting
-        completeness across the selected Woredas.
-        """
-    )
+    overall_priority = priority_level(overall_priority_score)
 
-    best_indicator = (
-        indicator_ranking.iloc[0]
-    )
-
-    worst_indicator = (
-        indicator_ranking.iloc[-1]
-    )
-
-    a, b = st.columns(2)
-
-    with a:
-
-        st.success(
-            f"🏆 Best reporting indicator: "
-            f"**{best_indicator['Indicator']}** "
-            f"({best_indicator['Reporting %']:.1f}%)"
-        )
-
-    with b:
-
-        st.warning(
-            f"⚠️ Lowest reporting indicator: "
-            f"**{worst_indicator['Indicator']}** "
-            f"({worst_indicator['Reporting %']:.1f}%)"
-        )
-
-    st.markdown("---")
-
-    st.subheader(
-        "🏆 Indicator Ranking"
-    )
-
-    st.dataframe(
-        indicator_ranking,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    st.markdown("---")
-
-    st.subheader(
-        "🚨 Critical Indicators"
-    )
-
-    critical_indicators = indicator_ranking[
-        indicator_ranking["Reporting %"] < 80
-    ]
-
-    if len(critical_indicators) > 0:
-
-        st.warning(
-            f"{len(critical_indicators)} indicator(s) "
-            "have reporting completeness below 80%."
-        )
-
-        st.dataframe(
-            critical_indicators[
-                [
-                    "Rank",
-                    "Indicator",
-                    "Missing Woredas",
-                    "Zero Values",
-                    "Reporting %",
-                    "Performance",
-                    "Priority"
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True
-        )
-
-    else:
-
-        st.success(
-            "✅ No indicator has reporting completeness below 80%."
-        )
-
-# ============================================================
-# TAB 3 — WOREDA PERFORMANCE
-# ============================================================
-
-with tab3:
-
-    st.header(
-        "🏘️ Woreda Performance & Ranking"
-    )
-
-    st.markdown(
-        """
-        Woredas are ranked according to the completeness
-        of indicator reporting.
-        """
-    )
-
-    best_woreda = (
-        woreda_ranking.iloc[0]
-    )
-
-    worst_woreda = (
-        woreda_ranking.iloc[-1]
-    )
-
-    a, b = st.columns(2)
-
-    with a:
-
-        st.success(
-            f"🏆 Best-performing Woreda: "
-            f"**{best_woreda['Woreda']}** "
-            f"({best_woreda['Completeness %']:.1f}%)"
-        )
-
-    with b:
-
-        st.warning(
-            f"⚠️ Lowest-performing Woreda: "
-            f"**{worst_woreda['Woreda']}** "
-            f"({worst_woreda['Completeness %']:.1f}%)"
-        )
-
-    st.markdown("---")
-
-    st.subheader(
-        "🏆 Woreda Ranking"
-    )
-
-    st.dataframe(
-        woreda_ranking,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    st.markdown("---")
-
-    st.subheader(
-        "⚠️ Underperforming Woredas"
-    )
-
-    underperforming = woreda_ranking[
-        woreda_ranking["Completeness %"] < 80
-    ]
-
-    if len(underperforming) > 0:
-
-        st.warning(
-            f"{len(underperforming)} Woreda(s) "
-            "have completeness below 80%."
-        )
-
-        st.dataframe(
-            underperforming[
-                [
-                    "Rank",
-                    "Woreda",
-                    "Missing Indicators",
-                    "Zero Values",
-                    "Completeness %",
-                    "Performance",
-                    "Priority"
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True
-        )
-
-    else:
-
-        st.success(
-            "✅ No Woreda has completeness below 80%."
-        )
-
-# ============================================================
-# TAB 4 — PRIORITY IDENTIFICATION
-# ============================================================
-
-with tab4:
-
-    st.header(
-        "🚨 Priority Identification"
-    )
-
-    st.markdown(
-        """
-        The platform automatically identifies areas requiring
-        management attention using missing data, zero values,
-        and reporting completeness.
-        """
-    )
-
-    high_count = (
-
-        (
-            woreda_ranking["Priority"]
-            == "High"
-        ).sum()
-
-        +
-
-        (
-            indicator_ranking["Priority"]
-            == "High"
-        ).sum()
-    )
-
-    medium_count = (
-
-        (
-            woreda_ranking["Priority"]
-            == "Medium"
-        ).sum()
-
-        +
-
-        (
-            indicator_ranking["Priority"]
-            == "Medium"
-        ).sum()
-    )
-
-    low_count = (
-
-        (
-            woreda_ranking["Priority"]
-            == "Low"
-        ).sum()
-
-        +
-
-        (
-            indicator_ranking["Priority"]
-            == "Low"
-        ).sum()
-    )
-
-    p1, p2, p3 = st.columns(3)
-
-    with p1:
-
-        st.metric(
-            "🔴 High Priority",
-            high_count
-        )
-
-    with p2:
-
-        st.metric(
-            "🟠 Medium Priority",
-            medium_count
-        )
-
-    with p3:
-
-        st.metric(
-            "🟡 Low Priority",
-            low_count
-        )
-
-    priority_chart = pd.DataFrame(
-        {
-            "Priority": [
-                "High",
-                "Medium",
-                "Low"
-            ],
-
-            "Count": [
-                high_count,
-                medium_count,
-                low_count
-            ]
-        }
-    )
-
-    fig = px.bar(
-        priority_chart,
-        x="Priority",
-        y="Count",
-        title="Priority Distribution"
-    )
-
-    st.plotly_chart(
-        fig,
-        use_container_width=True
-    )
-
-    st.subheader(
-        "🏘️ Priority Woredas"
-    )
-
-    priority_woredas = woreda_ranking[
-        woreda_ranking["Priority"]
-        != "No Immediate Priority"
-    ]
-
-    if len(priority_woredas) > 0:
-
-        st.dataframe(
-            priority_woredas[
-                [
-                    "Rank",
-                    "Woreda",
-                    "Completeness %",
-                    "Missing Indicators",
-                    "Zero Values",
-                    "Priority Score",
-                    "Priority",
-                    "Recommendation"
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True
-        )
-
-    else:
-
-        st.success(
-            "✅ No Woreda requires immediate priority attention."
-        )
-
-    st.subheader(
-        "📋 Priority Indicators"
-    )
-
-    priority_indicators = indicator_ranking[
-        indicator_ranking["Priority"]
-        != "No Immediate Priority"
-    ]
-
-    if len(priority_indicators) > 0:
-
-        st.dataframe(
-            priority_indicators[
-                [
-                    "Rank",
-                    "Indicator",
-                    "Reporting %",
-                    "Missing Woredas",
-                    "Zero Values",
-                    "Priority Score",
-                    "Priority",
-                    "Recommendation"
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True
-        )
-
-    else:
-
-        st.success(
-            "✅ No indicator requires immediate priority attention."
-        )
-
-    st.markdown("---")
-
-    st.subheader(
-        "🚨 Automatic Alerts"
-    )
-
-    if overall_completeness < 60:
-
+    if completeness < 60:
         st.error(
-            f"🔴 CRITICAL: Overall reporting completeness "
-            f"is only {overall_completeness:.1f}%."
+            f"🔴 High concern: overall reporting completeness is "
+            f"{completeness:.1f}%."
         )
-
-    elif overall_completeness < 80:
-
+    elif completeness < 80:
         st.warning(
-            f"🟠 ATTENTION: Overall reporting completeness "
-            f"is {overall_completeness:.1f}%."
+            f"🟠 Moderate concern: reporting completeness is "
+            f"{completeness:.1f}%."
         )
-
     else:
-
         st.success(
-            f"🟢 Overall reporting completeness "
-            f"is {overall_completeness:.1f}%."
+            f"🟢 Reporting completeness is {completeness:.1f}%."
         )
 
-    if missing_cells > 0:
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Overall Priority", overall_priority)
+    c2.metric("Missing Values", f"{missing_cells:,}")
+    c3.metric("Zero Values", f"{zero_cells:,}")
 
-        st.warning(
-            f"⚠️ There are {missing_cells:,} missing "
-            "data cells requiring review."
+    st.subheader("Critical Missing Data")
+    missing_table = []
+
+    for _, row in selected_df.iterrows():
+        for woreda in selected_woredas:
+            if woreda in selected_df.columns:
+                value = pd.to_numeric(
+                    row[woreda],
+                    errors="coerce",
+                )
+                if pd.isna(value):
+                    missing_table.append(
+                        {
+                            "Indicator": row["Activity"],
+                            "Woreda": woreda,
+                            "Issue": "Missing / not reported",
+                        }
+                    )
+
+    if missing_table:
+        st.dataframe(
+            pd.DataFrame(missing_table),
+            use_container_width=True,
+            height=400,
         )
-
-    if zero_cells > 0:
-
-        st.info(
-            f"ℹ️ There are {zero_cells:,} zero values. "
-            "Validate whether these represent true zero "
-            "service delivery or reporting/data-entry issues."
-        )
-
-# ============================================================
-# TAB 5 — PUBLIC HEALTH INTELLIGENCE
-# ============================================================
-
-with tab5:
-
-    st.header(
-        "🧠 Public-Health Intelligence"
-    )
-
-    st.markdown(
-        """
-        This section converts the reporting dataset into
-        management-oriented findings.
-        """
-    )
-
-    st.subheader(
-        "🔍 Automatically Generated Key Findings"
-    )
-
-    if overall_completeness >= 95:
-
-        st.success(
-            f"🟢 Reporting completeness is excellent "
-            f"at {overall_completeness:.1f}%."
-        )
-
-    elif overall_completeness >= 80:
-
-        st.info(
-            f"🔵 Overall reporting completeness is good "
-            f"at {overall_completeness:.1f}%, "
-            "but some gaps remain."
-        )
-
-    elif overall_completeness >= 60:
-
-        st.warning(
-            f"🟠 Overall reporting completeness is moderate "
-            f"at {overall_completeness:.1f}%. "
-            "Targeted follow-up is recommended."
-        )
-
     else:
+        st.success("No missing values found in the selected data.")
 
-        st.error(
-            f"🔴 Overall reporting completeness is poor "
-            f"at {overall_completeness:.1f}%. "
-            "Immediate management attention is recommended."
-        )
+# ============================================================
+# TAB 5: INTELLIGENCE
+# ============================================================
 
-    if len(woreda_ranking) > 1:
+with tab_objects[4]:
+    st.header("🧠 Public-Health Intelligence")
 
-        performance_gap = (
+    if not indicator_rank.empty:
+        worst_indicator = indicator_rank.iloc[0]
 
-            woreda_ranking.iloc[0][
-                "Completeness %"
-            ]
-
-            -
-
-            woreda_ranking.iloc[-1][
-                "Completeness %"
-            ]
-        )
-
+        st.subheader("Indicator-level finding")
         st.write(
-            f"📊 The difference between the best and lowest "
-            f"Woreda reporting completeness is "
-            f"**{performance_gap:.1f} percentage points**."
+            f"**{worst_indicator['Indicator']}** has the highest priority "
+            f"score among the selected indicators, with "
+            f"{worst_indicator['Reporting %']:.1f}% reporting."
         )
 
-    if len(underperforming) > 0:
+    if "woreda_rank" in locals() and not woreda_rank.empty:
+        worst_woreda = woreda_rank.iloc[0]
 
+        st.subheader("Woreda-level finding")
         st.write(
-            f"🏘️ **{len(underperforming)} Woreda(s)** "
-            "are below the 80% reporting threshold "
-            "and should receive targeted follow-up."
+            f"**{worst_woreda['Woreda']}** has the highest priority score "
+            f"among the selected Woredas, with "
+            f"{worst_woreda['Completeness %']:.1f}% completeness."
         )
 
-    if len(critical_indicators) > 0:
+    st.subheader("Management interpretation")
 
-        st.write(
-            f"📋 **{len(critical_indicators)} indicator(s)** "
-            "have reporting completeness below 80%."
+    if completeness >= 95:
+        st.success(
+            "The selected reporting dataset has very high completeness. "
+            "Management attention can focus more strongly on program "
+            "performance and service-delivery results."
         )
-
-    if zero_cells > 0:
-
-        st.write(
-            f"0️⃣ The dataset contains **{zero_cells:,} "
-            "zero values**. These should be interpreted "
-            "carefully because a zero may represent either "
-            "true absence of service or a reporting/data-entry problem."
+    elif completeness >= 80:
+        st.info(
+            "Reporting completeness is generally good, but selected "
+            "missing and zero values should be reviewed before drawing "
+            "strong programmatic conclusions."
         )
-
-    st.markdown("---")
-
-    st.subheader(
-        "🎯 Key Intelligence Summary"
-    )
-
-    intelligence_summary = pd.DataFrame(
-        {
-            "Intelligence Area": [
-                "Overall Reporting",
-                "Best Woreda",
-                "Lowest Woreda",
-                "Best Indicator",
-                "Lowest Indicator",
-                "Underperforming Woredas",
-                "Critical Indicators",
-                "Missing Data Cells",
-                "Zero Values"
-            ],
-
-            "Finding": [
-
-                f"{overall_completeness:.1f}%",
-
-                f"{best_woreda['Woreda']} "
-                f"({best_woreda['Completeness %']:.1f}%)",
-
-                f"{worst_woreda['Woreda']} "
-                f"({worst_woreda['Completeness %']:.1f}%)",
-
-                f"{best_indicator['Indicator']} "
-                f"({best_indicator['Reporting %']:.1f}%)",
-
-                f"{worst_indicator['Indicator']} "
-                f"({worst_indicator['Reporting %']:.1f}%)",
-
-                len(underperforming),
-
-                len(critical_indicators),
-
-                f"{missing_cells:,}",
-
-                f"{zero_cells:,}"
-            ]
-        }
-    )
-
-    st.dataframe(
-        intelligence_summary,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    st.markdown("---")
-
-    st.subheader(
-        "🎯 Management Focus Areas"
-    )
-
-    management_actions = []
-
-    if overall_completeness < 80:
-
-        management_actions.append(
-            "Improve overall reporting completeness through "
-            "targeted follow-up and supportive supervision."
-        )
-
-    if len(underperforming) > 0:
-
-        management_actions.append(
-            "Prioritize underperforming Woredas for data-quality "
-            "review and performance improvement."
-        )
-
-    if len(critical_indicators) > 0:
-
-        management_actions.append(
-            "Investigate indicators with low reporting completeness "
-            "and identify facilities responsible for reporting gaps."
-        )
-
-    if zero_cells > 0:
-
-        management_actions.append(
-            "Validate zero values to distinguish true zero "
-            "service delivery from data-entry or reporting problems."
-        )
-
-    if not management_actions:
-
-        management_actions.append(
-            "Maintain current reporting performance and continue "
-            "routine data-quality monitoring."
-        )
-
-    for action in management_actions:
-
-        st.markdown(
-            f"- 💡 {action}"
+    else:
+        st.warning(
+            "Data completeness requires management attention. "
+            "Performance interpretation should be combined with "
+            "data-quality verification."
         )
 
 # ============================================================
-# TAB 6 — DECISION SUPPORT
+# TAB 6: RECOMMENDATIONS
 # ============================================================
 
-with tab6:
+with tab_objects[5]:
+    st.header("💡 Decision-Support Recommendations")
 
-    st.header(
-        "💡 Decision-Support Recommendations"
-    )
+    st.subheader("🏘️ Woreda-level recommendations")
 
-    st.markdown(
-        """
-        The platform translates observed data patterns
-        into practical management actions.
-        """
-    )
-
-    st.subheader(
-        "🏘️ Woreda-Level Recommendations"
-    )
-
-    recommendation_woredas = woreda_ranking[
-        woreda_ranking["Completeness %"] < 80
-    ]
-
-    if len(recommendation_woredas) > 0:
-
-        for _, row in recommendation_woredas.iterrows():
-
-            st.markdown(
-                f"""
-                **{row['Woreda']} — {row['Performance']}**
-
-                - Completeness: **{row['Completeness %']:.1f}%**
-                - Missing indicators: **{row['Missing Indicators']}**
-                - Zero values: **{row['Zero Values']}**
-                - Priority: **{row['Priority']}**
-                - Recommended action: {row['Recommendation']}
-                """
+    if "woreda_rank" in locals() and not woreda_rank.empty:
+        for _, row in woreda_rank.head(10).iterrows():
+            st.write(
+                f"**{row['Woreda']} — {row['Priority']}:** "
+                f"{row['Recommendation']}"
             )
 
-            st.markdown("---")
+    st.subheader("📋 Indicator-level recommendations")
 
-    else:
-
-        st.success(
-            "✅ No Woreda currently requires targeted "
-            "performance intervention."
-        )
-
-    st.subheader(
-        "📋 Indicator-Level Recommendations"
-    )
-
-    recommendation_indicators = indicator_ranking[
-        indicator_ranking["Reporting %"] < 80
-    ]
-
-    if len(recommendation_indicators) > 0:
-
-        for _, row in recommendation_indicators.iterrows():
-
-            st.markdown(
-                f"""
-                **{row['Indicator']}**
-
-                - Reporting: **{row['Reporting %']:.1f}%**
-                - Missing Woredas: **{row['Missing Woredas']}**
-                - Zero values: **{row['Zero Values']}**
-                - Priority: **{row['Priority']}**
-                - Recommended action: {row['Recommendation']}
-                """
+    if not indicator_rank.empty:
+        for _, row in indicator_rank.head(10).iterrows():
+            st.write(
+                f"**{row['Indicator']} — {row['Priority']}:** "
+                f"{row['Recommendation']}"
             )
 
-            st.markdown("---")
+    st.subheader("👔 Executive action")
+    st.write(
+        "Use the priority list to focus supportive supervision, "
+        "data-quality review, mentorship and performance-improvement "
+        "actions on the Woredas and indicators with the largest gaps."
+    )
 
+# ============================================================
+# TAB 7: VISUALIZATION
+# ============================================================
+
+with tab_objects[6]:
+    st.header("📈 Visualization")
+
+    if selected_df.shape[1] <= 1:
+        st.warning("Select at least one Woreda for visualization.")
+    elif selected_df.empty:
+        st.warning("Select at least one indicator.")
     else:
+        st.subheader("🎯 Selected Indicators by Woreda")
 
-        st.success(
-            "✅ No indicator currently requires targeted "
-            "reporting intervention."
-        )
-
-    st.subheader(
-        "🎯 Executive Management Recommendations"
-    )
-
-    executive_recommendations = [
-
-        "Use the Woreda ranking to focus supportive "
-        "supervision on the lowest-performing Woredas.",
-
-        "Use the indicator ranking to identify indicators "
-        "requiring reporting-system improvement.",
-
-        "Review missing data before making program-performance conclusions.",
-
-        "Validate zero values before interpreting them "
-        "as low service utilization.",
-
-        "Share good reporting practices from high-performing Woredas.",
-
-        "Repeat the analysis routinely to monitor improvement over time."
-    ]
-
-    for recommendation in executive_recommendations:
-
-        st.markdown(
-            f"- **{recommendation}**"
-        )
-
-# ============================================================
-# TAB 7 — VISUALIZATION
-# ============================================================
-
-with tab7:
-
-    st.header(
-        "📈 Public Health Visualizations"
-    )
-
-    st.markdown(
-        """
-        ### 🎯 Visualization of Your Selected Indicators
-
-        The charts below automatically use the **indicators and
-        Woredas selected from the left sidebar**.
-        """
-    )
-
-    # ========================================================
-    # SELECTED INDICATOR VISUALIZATION
-    # ========================================================
-
-    st.subheader(
-        "🎯 Selected Indicators by Woreda"
-    )
-
-    st.caption(
-        f"Showing {len(selected_indicators)} selected indicator(s) "
-        f"across {len(selected_woredas)} selected Woreda(s)."
-    )
-
-    # --------------------------------------------------------
-    # VISUALIZATION SELECTION
-    # --------------------------------------------------------
-
-    selected_visualization = st.selectbox(
-
-        "Choose visualization",
-
-        [
+        visualization_options = [
             "📊 Grouped Bar — Indicator by Woreda",
             "📈 Line Chart — Indicator by Woreda",
             "📚 Stacked Bar — Indicator by Woreda",
             "🔥 Heatmap — Indicator vs Woreda",
-            "📊 Total Reported Value by Indicator"
-        ],
-
-        key="selected_indicator_visualization_v06"
-    )
-
-    # ========================================================
-    # PREPARE CHART DATA
-    # ========================================================
-
-    chart_df = selected_df.melt(
-
-        id_vars=["Activity"],
-
-        value_vars=selected_woredas,
-
-        var_name="Woreda",
-
-        value_name="Reported Value"
-    )
-
-    # ========================================================
-    # GROUPED BAR
-    # ========================================================
-
-    if selected_visualization == (
-        "📊 Grouped Bar — Indicator by Woreda"
-    ):
-
-        fig = px.bar(
-
-            chart_df,
-
-            x="Woreda",
-
-            y="Reported Value",
-
-            color="Activity",
-
-            barmode="group",
-
-            title="Selected Indicators by Woreda",
-
-            labels={
-                "Activity": "Indicator",
-                "Woreda": "Woreda",
-                "Reported Value": "Reported Value"
-            },
-
-            hover_data={
-                "Activity": True,
-                "Woreda": True,
-                "Reported Value": True
-            }
-        )
-
-        fig.update_layout(
-            xaxis_tickangle=-45,
-            legend_title="Indicator"
-        )
-
-        st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
-
-    # ========================================================
-    # LINE CHART
-    # ========================================================
-
-    elif selected_visualization == (
-        "📈 Line Chart — Indicator by Woreda"
-    ):
-
-        fig = px.line(
-
-            chart_df,
-
-            x="Woreda",
-
-            y="Reported Value",
-
-            color="Activity",
-
-            markers=True,
-
-            title="Selected Indicator Values Across Woredas",
-
-            labels={
-                "Activity": "Indicator",
-                "Woreda": "Woreda",
-                "Reported Value": "Reported Value"
-            }
-        )
-
-        fig.update_layout(
-            xaxis_tickangle=-45,
-            legend_title="Indicator"
-        )
-
-        st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
-
-    # ========================================================
-    # STACKED BAR
-    # ========================================================
-
-    elif selected_visualization == (
-        "📚 Stacked Bar — Indicator by Woreda"
-    ):
-
-        fig = px.bar(
-
-            chart_df,
-
-            x="Woreda",
-
-            y="Reported Value",
-
-            color="Activity",
-
-            barmode="stack",
-
-            title="Stacked Selected Indicators by Woreda",
-
-            labels={
-                "Activity": "Indicator",
-                "Woreda": "Woreda",
-                "Reported Value": "Reported Value"
-            }
-        )
-
-        fig.update_layout(
-            xaxis_tickangle=-45,
-            legend_title="Indicator"
-        )
-
-        st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
-
-    # ========================================================
-    # HEATMAP
-    # ========================================================
-
-    elif selected_visualization == (
-        "🔥 Heatmap — Indicator vs Woreda"
-    ):
-
-        heatmap_df = (
-            selected_df
-            .set_index("Activity")
-            [selected_woredas]
-        )
-
-        fig = px.imshow(
-
-            heatmap_df,
-
-            aspect="auto",
-
-            title="Selected Indicators vs Woredas",
-
-            labels={
-                "x": "Woreda",
-                "y": "Indicator",
-                "color": "Reported Value"
-            },
-
-            text_auto=True
-        )
-
-        st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
-
-    # ========================================================
-    # TOTAL BY INDICATOR
-    # ========================================================
-
-    elif selected_visualization == (
-        "📊 Total Reported Value by Indicator"
-    ):
-
-        totals = (
-            selected_df[
-                ["Activity"] + selected_woredas
-            ]
-            .set_index("Activity")
-            .sum(
-                axis=1,
-                skipna=True
-            )
-            .reset_index()
-        )
-
-        totals.columns = [
-            "Indicator",
-            "Total Reported Value"
+            "📊 Total Reported Value by Indicator",
         ]
 
-        fig = px.bar(
-
-            totals,
-
-            x="Indicator",
-
-            y="Total Reported Value",
-
-            title="Total Reported Value by Selected Indicator",
-
-            text="Total Reported Value",
-
-            labels={
-                "Indicator": "Indicator",
-                "Total Reported Value": "Total Reported Value"
-            }
+        selected_visualization = st.selectbox(
+            "Choose visualization",
+            visualization_options,
+            key="selected_visualization_v07",
         )
 
-        fig.update_layout(
-            xaxis_tickangle=-45
+        selected_long = selected_df.melt(
+            id_vars=["Activity"],
+            var_name="Woreda",
+            value_name="Value",
         )
 
-        st.plotly_chart(
-            fig,
-            use_container_width=True
+        selected_long["Value"] = pd.to_numeric(
+            selected_long["Value"],
+            errors="coerce",
         )
 
-    # ========================================================
-    # VISUALIZATION DATA TABLE
-    # ========================================================
+        selected_long = selected_long.dropna(subset=["Value"])
 
-    st.markdown("---")
+        if selected_visualization.startswith("📊 Grouped"):
+            fig = px.bar(
+                selected_long,
+                x="Woreda",
+                y="Value",
+                color="Activity",
+                barmode="group",
+                title="Selected Indicators by Woreda",
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader(
-        "📋 Data Used for Selected Visualization"
-    )
+        elif selected_visualization.startswith("📈 Line"):
+            fig = px.line(
+                selected_long,
+                x="Woreda",
+                y="Value",
+                color="Activity",
+                markers=True,
+                title="Selected Indicators by Woreda",
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
-    st.dataframe(
-        selected_df[
-            ["Activity"] + selected_woredas
-        ],
-        use_container_width=True,
-        hide_index=True
-    )
+        elif selected_visualization.startswith("📚 Stacked"):
+            fig = px.bar(
+                selected_long,
+                x="Woreda",
+                y="Value",
+                color="Activity",
+                barmode="stack",
+                title="Stacked Indicator Values by Woreda",
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
-    # ========================================================
-    # SECONDARY VISUALIZATIONS
-    # ========================================================
+        elif selected_visualization.startswith("🔥 Heatmap"):
+            heat = selected_df.set_index("Activity")
+            heat = heat.apply(pd.to_numeric, errors="coerce")
 
-    st.markdown("---")
+            fig = px.imshow(
+                heat,
+                aspect="auto",
+                labels={
+                    "x": "Woreda",
+                    "y": "Indicator",
+                    "color": "Value",
+                },
+                title="Indicator vs Woreda Heatmap",
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader(
-        "📊 Additional Performance Visualizations"
-    )
+        else:
+            totals = (
+                selected_long.groupby("Activity")["Value"]
+                .sum()
+                .reset_index()
+                .sort_values("Value", ascending=False)
+            )
 
-    secondary_visualization = st.selectbox(
+            fig = px.bar(
+                totals,
+                x="Activity",
+                y="Value",
+                title="Total Reported Value by Indicator",
+            )
+            fig.update_layout(xaxis_tickangle=-45)
+            st.plotly_chart(fig, use_container_width=True)
 
-        "Choose additional visualization",
+        st.subheader("📌 Secondary Visualization")
 
-        [
+        secondary_options = [
             "🏘️ Woreda Completeness Ranking",
             "📋 Indicator Completeness Ranking",
             "↔️ Reported vs Missing by Woreda",
-            "🎯 Woreda Completeness vs Missing Indicators"
-        ],
+            "🎯 Woreda Completeness vs Missing Indicators",
+        ]
 
-        key="secondary_visualization_v06"
-    )
-
-    # --------------------------------------------------------
-    # WOREDA COMPLETENESS
-    # --------------------------------------------------------
-
-    if secondary_visualization == (
-        "🏘️ Woreda Completeness Ranking"
-    ):
-
-        chart_data = woreda_ranking.copy()
-
-        fig = px.bar(
-
-            chart_data,
-
-            x="Woreda",
-
-            y="Completeness %",
-
-            text="Completeness %",
-
-            title="Woreda Reporting Completeness Ranking",
-
-            labels={
-                "Completeness %":
-                "Completeness (%)"
-            }
+        secondary = st.selectbox(
+            "Choose secondary visualization",
+            secondary_options,
+            key="secondary_visualization_v07",
         )
 
-        fig.update_layout(
-            xaxis_tickangle=-45
+        if secondary.startswith("🏘️"):
+            fig = px.bar(
+                woreda_rank.sort_values("Completeness %"),
+                x="Completeness %",
+                y="Woreda",
+                orientation="h",
+                title="Woreda Completeness Ranking",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        elif secondary.startswith("📋"):
+            fig = px.bar(
+                indicator_rank.sort_values("Reporting %"),
+                x="Reporting %",
+                y="Indicator",
+                orientation="h",
+                title="Indicator Completeness Ranking",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        elif secondary.startswith("↔️"):
+            compare = woreda_rank[
+                ["Woreda", "Reported Indicators", "Missing Indicators"]
+            ].melt(
+                id_vars=["Woreda"],
+                var_name="Status",
+                value_name="Count",
+            )
+
+            fig = px.bar(
+                compare,
+                x="Woreda",
+                y="Count",
+                color="Status",
+                barmode="group",
+                title="Reported vs Missing Indicators by Woreda",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        else:
+            fig = px.scatter(
+                woreda_rank,
+                x="Completeness %",
+                y="Missing Indicators",
+                text="Woreda",
+                title="Woreda Completeness vs Missing Indicators",
+            )
+            fig.update_traces(textposition="top center")
+            st.plotly_chart(fig, use_container_width=True)
+
+# ============================================================
+# TAB 8: PLAN VS ACTUAL
+# ============================================================
+
+if plan_long is not None:
+    with tab_objects[7]:
+        st.header("🎯 Plan vs Actual Intelligence")
+
+        st.info(
+            f"Reporting period: **{months_covered} month(s)**. "
+            f"Expected plan is based on **Monthly Target × {months_covered}**. "
+            "The official annual Woreda target is retained as a reference."
         )
 
-        st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
+        if pa_df is None or pa_df.empty:
+            st.warning(
+                "The plan was uploaded, but no Plan-vs-Actual records "
+                "could be created from the current performance data."
+            )
+        else:
+            # Restrict the display to the selected Woredas/indicators.
+            pa_selected = pa_df.copy()
 
-    # --------------------------------------------------------
-    # INDICATOR COMPLETENESS
-    # --------------------------------------------------------
+            if selected_woredas:
+                pa_selected = pa_selected[
+                    pa_selected["Woreda"].isin(selected_woredas)
+                ]
 
-    elif secondary_visualization == (
-        "📋 Indicator Completeness Ranking"
-    ):
+            if selected_indicators:
+                # selected actual indicators may differ slightly from plan names
+                pa_selected = pa_selected[
+                    pa_selected["Actual Indicator"].isin(
+                        selected_indicators
+                    )
+                ]
 
-        chart_data = indicator_ranking.copy()
+            valid = pa_selected[
+                pa_selected["Plan"].notna()
+                & pa_selected["Actual"].notna()
+                & (pa_selected["Plan"] > 0)
+            ].copy()
 
-        fig = px.bar(
+            total_plan = valid["Plan"].sum()
+            total_actual = valid["Actual"].sum()
 
-            chart_data,
+            overall_achievement = (
+                total_actual / total_plan * 100
+                if total_plan > 0
+                else np.nan
+            )
 
-            x="Indicator",
+            total_gap = total_actual - total_plan
+            missing_actual = int(
+                pa_selected["Actual"].isna().sum()
+            )
+            zero_actual = int(
+                (pa_selected["Actual"].fillna(np.nan) == 0).sum()
+            )
 
-            y="Reporting %",
+            c1, c2, c3, c4, c5 = st.columns(5)
 
-            text="Reporting %",
+            c1.metric(
+                "Total Plan",
+                f"{total_plan:,.0f}",
+            )
+            c2.metric(
+                "Total Actual",
+                f"{total_actual:,.0f}",
+            )
+            c3.metric(
+                "Achievement",
+                (
+                    f"{overall_achievement:.1f}%"
+                    if pd.notna(overall_achievement)
+                    else "N/A"
+                ),
+            )
+            c4.metric(
+                "Gap",
+                f"{total_gap:,.0f}",
+            )
+            c5.metric(
+                "Missing Actual",
+                f"{missing_actual:,}",
+            )
 
-            title="Indicator Reporting Completeness Ranking",
+            # Automatic interpretation.
+            st.subheader("🧠 Automatic Interpretation")
 
-            labels={
-                "Reporting %":
-                "Reporting (%)"
-            }
-        )
+            if pd.isna(overall_achievement):
+                st.warning(
+                    "There is not enough matched Plan and Actual data "
+                    "to calculate overall achievement."
+                )
+            elif overall_achievement >= 100:
+                st.success(
+                    f"Overall achievement is {overall_achievement:.1f}%. "
+                    "The selected program has met or exceeded the "
+                    "expected plan for the selected reporting period. Values substantially above "
+                    "100% should still be validated."
+                )
+            elif overall_achievement >= 95:
+                st.success(
+                    f"Overall achievement is {overall_achievement:.1f}%, "
+                    "indicating excellent progress against plan."
+                )
+            elif overall_achievement >= 80:
+                st.info(
+                    f"Overall achievement is {overall_achievement:.1f}%, "
+                    "indicating generally good progress, with remaining "
+                    "gaps requiring monitoring."
+                )
+            elif overall_achievement >= 60:
+                st.warning(
+                    f"Overall achievement is {overall_achievement:.1f}%, "
+                    "indicating moderate performance and a need for "
+                    "targeted improvement."
+                )
+            else:
+                st.error(
+                    f"Overall achievement is {overall_achievement:.1f}%. "
+                    "This indicates a substantial gap against plan and "
+                    "requires priority management attention."
+                )
 
-        fig.update_layout(
-            xaxis_tickangle=-45
-        )
+            # Woreda ranking.
+            st.subheader("🏘️ Woreda Achievement Ranking")
 
-        st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
+            woreda_pa = aggregate_plan_actual_by_woreda(
+                pa_selected
+            )
 
-    # --------------------------------------------------------
-    # REPORTED VS MISSING
-    # --------------------------------------------------------
+            st.dataframe(
+                woreda_pa.sort_values(
+                    "Achievement %",
+                    ascending=True,
+                ),
+                use_container_width=True,
+                height=400,
+            )
 
-    elif secondary_visualization == (
-        "↔️ Reported vs Missing by Woreda"
-    ):
+            # Indicator ranking.
+            st.subheader("📋 Indicator Achievement Ranking")
 
-        status_df = woreda_ranking[
-            [
+            indicator_pa = aggregate_plan_actual_by_indicator(
+                pa_selected
+            )
+
+            st.dataframe(
+                indicator_pa.sort_values(
+                    "Achievement %",
+                    ascending=True,
+                ),
+                use_container_width=True,
+                height=450,
+            )
+
+            # Critical gaps.
+            st.subheader("🚨 Critical Gaps")
+
+            critical = pa_selected[
+                (
+                    (pa_selected["Priority"] == "High")
+                    | (
+                        pa_selected["Achievement %"].notna()
+                        & (pa_selected["Achievement %"] < 60)
+                    )
+                    | (
+                        pa_selected["Actual"].isna()
+                        & pa_selected["Plan"].notna()
+                    )
+                )
+            ].copy()
+
+            critical_cols = [
+                "Actual Indicator",
                 "Woreda",
-                "Reported Indicators",
-                "Missing Indicators"
+                "Months Covered",
+                "Monthly Plan",
+                "Period Plan",
+                "Annual Plan",
+                "Plan",
+                "Actual",
+                "Achievement %",
+                "Gap",
+                "Interpretation",
+                "Priority",
             ]
-        ].copy()
 
-        status_melted = status_df.melt(
+            if not critical.empty:
+                st.dataframe(
+                    critical[
+                        [
+                            c for c in critical_cols
+                            if c in critical.columns
+                        ]
+                    ].sort_values(
+                        ["Priority", "Achievement %"],
+                        ascending=[True, True],
+                    ),
+                    use_container_width=True,
+                    height=450,
+                )
+            else:
+                st.success(
+                    "No critical Plan-vs-Actual gaps were detected "
+                    "in the selected data."
+                )
 
-            id_vars="Woreda",
+            # Visualization.
+            st.subheader("📈 Plan vs Actual Visualization")
 
-            var_name="Status",
+            pa_chart_options = [
+                "📊 Plan vs Actual by Woreda",
+                "📋 Plan vs Actual by Indicator",
+                "🎯 Achievement % by Woreda",
+                "🎯 Achievement % by Indicator",
+            ]
 
-            value_name="Count"
-        )
+            pa_chart = st.selectbox(
+                "Choose Plan-vs-Actual visualization",
+                pa_chart_options,
+                key="plan_actual_chart_v07",
+            )
 
-        fig = px.bar(
+            if pa_chart.startswith("📊"):
+                chart_df = woreda_pa.melt(
+                    id_vars=["Woreda"],
+                    value_vars=["Plan", "Actual"],
+                    var_name="Type",
+                    value_name="Value",
+                )
 
-            status_melted,
+                fig = px.bar(
+                    chart_df,
+                    x="Woreda",
+                    y="Value",
+                    color="Type",
+                    barmode="group",
+                    title="Plan vs Actual by Woreda",
+                )
+                st.plotly_chart(fig, use_container_width=True)
 
-            x="Woreda",
+            elif pa_chart.startswith("📋"):
+                chart_df = indicator_pa.melt(
+                    id_vars=["Plan Indicator"],
+                    value_vars=["Plan", "Actual"],
+                    var_name="Type",
+                    value_name="Value",
+                )
 
-            y="Count",
+                fig = px.bar(
+                    chart_df,
+                    x="Plan Indicator",
+                    y="Value",
+                    color="Type",
+                    barmode="group",
+                    title="Plan vs Actual by Indicator",
+                )
+                fig.update_layout(xaxis_tickangle=-45)
+                st.plotly_chart(fig, use_container_width=True)
 
-            color="Status",
+            elif pa_chart.startswith("🎯") and "Woreda" in pa_chart:
+                chart_df = woreda_pa.dropna(
+                    subset=["Achievement %"]
+                ).sort_values("Achievement %")
 
-            barmode="group",
+                fig = px.bar(
+                    chart_df,
+                    x="Achievement %",
+                    y="Woreda",
+                    orientation="h",
+                    title="Achievement % by Woreda",
+                )
+                fig.add_vline(
+                    x=95,
+                    line_dash="dash",
+                    annotation_text="95% target",
+                )
+                st.plotly_chart(fig, use_container_width=True)
 
-            title="Reported vs Missing Indicators by Woreda"
-        )
+            else:
+                chart_df = indicator_pa.dropna(
+                    subset=["Achievement %"]
+                ).sort_values("Achievement %")
 
-        fig.update_layout(
-            xaxis_tickangle=-45
-        )
+                fig = px.bar(
+                    chart_df,
+                    x="Achievement %",
+                    y="Plan Indicator",
+                    orientation="h",
+                    title="Achievement % by Indicator",
+                )
+                fig.add_vline(
+                    x=95,
+                    line_dash="dash",
+                    annotation_text="95% target",
+                )
+                st.plotly_chart(fig, use_container_width=True)
 
-        st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
+            st.caption(
+                "Plan values shown as **Plan** are the selected-period expected plan. "
+                "Annual Plan is the official annual Woreda target from the uploaded workbook."
+            )
 
-    # --------------------------------------------------------
-    # SCATTER
-    # --------------------------------------------------------
+            # Matching quality.
+            st.subheader("🔗 Indicator Matching Quality")
 
-    elif secondary_visualization == (
-        "🎯 Woreda Completeness vs Missing Indicators"
-    ):
+            if indicator_match_df is not None:
+                st.dataframe(
+                    indicator_match_df,
+                    use_container_width=True,
+                    height=350,
+                )
 
-        fig = px.scatter(
+                unmatched = indicator_match_df[
+                    indicator_match_df["Match Type"] == "Unmatched"
+                ]
 
-            woreda_ranking,
+                fuzzy = indicator_match_df[
+                    indicator_match_df["Match Type"] == "Fuzzy"
+                ]
 
-            x="Missing Indicators",
+                if not unmatched.empty:
+                    st.warning(
+                        f"{len(unmatched)} performance indicator(s) "
+                        "could not be matched to the plan."
+                    )
 
-            y="Completeness %",
+                if not fuzzy.empty:
+                    st.info(
+                        f"{len(fuzzy)} indicator(s) were matched using "
+                        "name similarity. Review these matches before "
+                        "using the results for formal reporting."
+                    )
 
-            size="Zero Values",
+            # Detailed data.
+            with st.expander("🔍 View detailed Plan-vs-Actual records"):
+                detail_cols = [
+                    "Actual Indicator",
+                    "Plan Indicator",
+                    "Woreda",
+                    "Plan",
+                    "Actual",
+                    "Achievement %",
+                    "Gap",
+                    "Interpretation",
+                    "Priority",
+                ]
 
-            hover_name="Woreda",
-
-            title="Woreda Completeness vs Missing Indicators",
-
-            labels={
-                "Missing Indicators":
-                "Missing Indicators",
-
-                "Completeness %":
-                "Completeness (%)",
-
-                "Zero Values":
-                "Zero Values"
-            }
-        )
-
-        st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
+                st.dataframe(
+                    pa_selected[
+                        [
+                            c for c in detail_cols
+                            if c in pa_selected.columns
+                        ]
+                    ],
+                    use_container_width=True,
+                    height=500,
+                )
 
 # ============================================================
 # FOOTER
@@ -2103,8 +1884,15 @@ with tab7:
 
 st.markdown("---")
 
-st.caption(
-    "🏥 Public Health Intelligence Platform | "
-    "DHIS-2 + Data Analytics + AI Engineering | "
-    "Version 0.6"
-)
+if plan_long is not None:
+    st.caption(
+        "🏥 Public Health Intelligence Platform | "
+        "DHIS-2 + Data Analytics + AI Engineering | Version 0.7.1 | "
+        "Performance + Plan-vs-Actual Intelligence"
+    )
+else:
+    st.caption(
+        "🏥 Public Health Intelligence Platform | "
+        "DHIS-2 + Data Analytics + AI Engineering | Version 0.7.1 | "
+        "Performance-only mode"
+    )
